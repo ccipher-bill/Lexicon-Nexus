@@ -16,7 +16,9 @@ export default defineConfig(({ mode }) => {
       },
       resolve: {
         alias: {
-          '@': path.resolve(__dirname, '.'),
+          // FIX: __dirname is not available in ESM modules.
+          // `path.resolve('.')` resolves to the project root where Vite is executed.
+          '@': path.resolve('.'),
         }
       }
     };

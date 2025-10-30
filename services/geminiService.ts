@@ -3,201 +3,363 @@
  * SPDX-License-Identifier: Apache-2.0
 */
 
-import {GoogleGenAI} from '@google/genai';
+import {GoogleGenAI, Type} from '@google/genai';
+import * as cache from './cacheService';
+import * as settingsService from './settingsService';
 
-// This check is for development-time feedback.
-if (!process.env.API_KEY) {
-  console.error(
-    'API_KEY environment variable is not set. The application will not be able to connect to the Gemini API.',
-  );
+const MAX_RETRIES = 3;
+const INITIAL_BACKOFF_MS = 2000;
+
+/**
+ * Creates and returns a new GoogleGenAI instance using the currently active API key.
+ * This function is called before each API request to ensure the correct key is used.
+ * @returns A configured GoogleGenAI instance.
+ * @throws An error if no API key is configured.
+ */
+function getAiInstance(): GoogleGenAI {
+  const apiKey = settingsService.getApiKey();
+  if (!apiKey) {
+    throw new Error('API Key is not configured. Please add it in the settings panel.');
+  }
+  return new GoogleGenAI({ apiKey });
 }
 
-// The "!" asserts API_KEY is non-null after the check.
-const ai = new GoogleGenAI({apiKey: process.env.API_KEY!});
-const artModelName = 'gemini-flash-latest';
-const textModelName = 'gemini-flash-lite-latest';
-/**
- * Art-direction toggle for ASCII art generation.
- * `true`: Slower, higher-quality results (allows the model to "think").
- * `false`: Faster, potentially lower-quality results (skips thinking).
- */
-const ENABLE_THINKING_FOR_ASCII_ART = false;
-
-/**
- * Art-direction toggle for blocky ASCII text generation.
- * `true`: Generates both creative art and blocky text for the topic name.
- * `false`: Generates only the creative ASCII art.
- */
-const ENABLE_ASCII_TEXT_GENERATION = false;
+interface Hotspot {
+  char: string;
+  x: number; // column
+  y: number; // row
+  concept: string;
+}
 
 export interface AsciiArtData {
   art: string;
-  text?: string; // Text is now optional
+  hotspots?: Hotspot[];
+}
+
+interface Resource {
+  title: string;
+  url?: string;
+  description: string;
+}
+
+export interface DeepDiveData {
+  summary: string;
+  resources: Resource[];
+}
+
+export interface AncillaryData {
+  artData: AsciiArtData;
+  concepts: string[];
 }
 
 /**
- * Streams a definition for a given topic from the Gemini API.
+ * A centralized error handler for Gemini API calls.
+ * It checks for specific rate-limiting errors and returns a user-friendly message.
+ * @param error The error object caught.
+ * @param context A string describing the operation that failed (e.g., "generate ASCII art").
+ * @returns A new Error object with a cleaned-up message.
+ */
+function handleGeminiError(error: unknown, context: string): Error {
+  console.error(`Error during ${context}:`, error);
+  let message = 'An unknown error occurred.';
+  if (error instanceof Error) {
+    message = error.message;
+  }
+
+  // Check for Gemini-specific rate limit error structure in the message string
+  if (typeof message === 'string' && (message.includes('RESOURCE_EXHAUSTED') || message.includes('"code":429') || message.includes('rate limit'))) {
+    // Return a more user-friendly error for rate limiting.
+    return new Error('API rate limit exceeded. Please wait a moment and try again.');
+  }
+
+  // For other errors, return a generic message that includes the context.
+  return new Error(`Could not ${context}. ${message}`);
+}
+
+/**
+ * A wrapper for non-streaming Gemini API calls that implements exponential backoff on rate limit errors.
+ * @param requestFn The async function that makes the API call.
+ * @param onRetry An optional callback to inform the UI about a retry attempt.
+ * @returns The result of the request function.
+ */
+async function geminiRequestWithRetry<T>(
+  requestFn: () => Promise<T>,
+  onRetry?: (attempt: number, delay: number) => void
+): Promise<T> {
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    try {
+      return await requestFn();
+    } catch (error: unknown) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+
+      if (lastError.message.includes('API rate limit exceeded')) {
+        if (attempt < MAX_RETRIES - 1) {
+          const delay = INITIAL_BACKOFF_MS * Math.pow(2, attempt);
+          if (onRetry) {
+            onRetry(attempt + 1, delay);
+          }
+          console.log(`Rate limit exceeded. Retrying in ${delay}ms... (Attempt ${attempt + 1})`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+      }
+      
+      throw lastError;
+    }
+  }
+  throw lastError!;
+}
+
+
+/**
+ * Streams a definition for a given topic from the Gemini API, with built-in retry logic.
  * @param topic The word or term to define.
- * @returns An async generator that yields text chunks of the definition.
+ * @returns An async generator that yields text chunks of the definition or retry status messages.
  */
 export async function* streamDefinition(
-  topic: string,
+  topicOrQuery: string,
+  file?: { data: string; mimeType: string; }
 ): AsyncGenerator<string, void, undefined> {
-  if (!process.env.API_KEY) {
-    yield 'Error: API_KEY is not configured. Please check your environment variables to continue.';
-    return;
+  const ai = getAiInstance();
+  const modelId = settingsService.getActiveModelId();
+  let contents: any;
+
+  if (file) {
+    // This is a file query.
+    contents = {
+      parts: [
+        { inlineData: { mimeType: file.mimeType, data: file.data } },
+        { text: `Based on the provided document, answer the following question: "${topicOrQuery}"` }
+      ]
+    };
+  } else {
+    // This is a standard topic definition request.
+    const prompt = `Provide a concise, single-paragraph encyclopedia-style definition for the term: "${topicOrQuery}". Be informative and neutral. Do not use markdown, titles, or any special formatting. Respond with only the text of the definition itself.`;
+    contents = prompt;
   }
 
-  const prompt = `Provide a concise, single-paragraph encyclopedia-style definition for the term: "${topic}". Be informative and neutral. Do not use markdown, titles, or any special formatting. Respond with only the text of the definition itself.`;
-
-  try {
-    const response = await ai.models.generateContentStream({
-      model: textModelName,
-      contents: prompt,
-      config: {
-        // Disable thinking for the lowest possible latency, as requested.
-        thinkingConfig: { thinkingBudget: 0 },
-      },
-    });
-
-    for await (const chunk of response) {
-      if (chunk.text) {
-        yield chunk.text;
-      }
-    }
-  } catch (error) {
-    console.error('Error streaming from Gemini:', error);
-    const errorMessage =
-      error instanceof Error ? error.message : 'An unknown error occurred.';
-    yield `Error: Could not generate content for "${topic}". ${errorMessage}`;
-    // Re-throwing allows the caller to handle the error state definitively.
-    throw new Error(errorMessage);
-  }
-}
-
-/**
- * Generates a single random word or concept using the Gemini API.
- * @returns A promise that resolves to a single random word.
- */
-export async function getRandomWord(): Promise<string> {
-  if (!process.env.API_KEY) {
-    throw new Error('API_KEY is not configured.');
-  }
-
-  const prompt = `Generate a single, random, interesting English word or a two-word concept. It can be a noun, verb, adjective, or a proper noun. Respond with only the word or concept itself, with no extra text, punctuation, or formatting.`;
-
-  try {
-    const response = await ai.models.generateContent({
-      model: textModelName,
-      contents: prompt,
-      config: {
-        // Disable thinking for low latency.
-        thinkingConfig: { thinkingBudget: 0 },
-      },
-    });
-    return response.text.trim();
-  } catch (error) {
-    console.error('Error getting random word from Gemini:', error);
-    const errorMessage =
-      error instanceof Error ? error.message : 'An unknown error occurred.';
-    throw new Error(`Could not get random word: ${errorMessage}`);
-  }
-}
-
-/**
- * Generates ASCII art and optionally text for a given topic.
- * @param topic The topic to generate art for.
- * @returns A promise that resolves to an object with art and optional text.
- */
-export async function generateAsciiArt(topic: string): Promise<AsciiArtData> {
-  if (!process.env.API_KEY) {
-    throw new Error('API_KEY is not configured.');
-  }
-  
-  const artPromptPart = `1. "art": meta ASCII visualization of the word "${topic}":
-  - Palette: │─┌┐└┘├┤┬┴┼►◄▲▼○●◐◑░▒▓█▀▄■□▪▫★☆♦♠♣♥⟨⟩/\\_|
-  - Shape mirrors concept - make the visual form embody the word's essence
-  - Examples: 
-    * "explosion" → radiating lines from center
-    * "hierarchy" → pyramid structure
-    * "flow" → curved directional lines
-  - Return as single string with \\n for line breaks`;
-
-
-  const keysDescription = `one key: "art"`;
-  const promptBody = artPromptPart;
-
-  const prompt = `For "${topic}", create a JSON object with ${keysDescription}.
-${promptBody}
-
-Return ONLY the raw JSON object, no additional text. The response must start with "{" and end with "}" and contain only the art property.`;
-
-  const maxRetries = 1;
   let lastError: Error | null = null;
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     try {
-      // FIX: Construct config object conditionally to avoid spreading a boolean
+      const response = await ai.models.generateContentStream({
+        model: modelId,
+        contents: contents,
+        config: {
+          thinkingConfig: { thinkingBudget: 0 },
+        },
+      });
+
+      for await (const chunk of response) {
+        if (chunk.text) {
+          yield chunk.text;
+        }
+      }
+      return; // Success, exit generator.
+    } catch (error) {
+      const context = `generate content for "${topicOrQuery}"`;
+      lastError = handleGeminiError(error, context);
+
+      if (lastError.message.includes('API rate limit exceeded')) {
+        if (attempt < MAX_RETRIES - 1) {
+          const delay = INITIAL_BACKOFF_MS * Math.pow(2, attempt);
+          yield `[SYSTEM:RETRY]Rate limit exceeded. Retrying in ${Math.round(delay/1000)}s...`;
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+      }
+      throw lastError;
+    }
+  }
+}
+
+/**
+ * Generates ASCII art and related concepts for a topic, with retry logic.
+ * @param topic The topic to generate data for.
+ * @param onRetry An optional callback to inform the UI about a retry attempt.
+ * @returns A promise resolving to an object with art and concepts.
+ */
+export async function generateAncillaryData(
+  topic: string,
+  onRetry?: (attempt: number, delay: number) => void
+): Promise<AncillaryData> {
+  const modelId = settingsService.getActiveModelId();
+  const cacheKey = `ancillary_${modelId}_${topic.toLowerCase()}`;
+  const cachedData = cache.get<AncillaryData>(cacheKey);
+  if (cachedData) {
+    return cachedData;
+  }
+
+  const apiCall = async () => {
+    const ai = getAiInstance();
+    const prompt = `
+      For the topic "${topic}", generate two pieces of data:
+      1. A list of 5-7 closely related concepts.
+      2. A meta ASCII art visualization for the topic.
+
+      The response must be a single JSON object with two keys: "concepts" and "artData".
+
+      - "concepts": An array of 5-7 strings. For "Hypertext", this could be ["HTML", "Vannevar Bush", "Non-linear", "World Wide Web", "Hyperlink"].
+      - "artData": An object with two keys:
+        - "art": A string containing the ASCII art. Use this palette: │─┌┐└┘├┤┬┴┼►◄▲▼○●◐◑░▒▓█▀▄■□▪▫★☆♦♠♣♥⟨⟩/\\_|. The visual form must embody the word's essence.
+        - "hotspots": An array of 3-5 objects, where each object identifies a key character in the art and has keys: "char", "x" (column), "y" (row), and "concept" (a short related idea).
+    `;
+
+    try {
+      const enableThinking = settingsService.getSetting<boolean>('highQualityArt', true);
+
       const config: any = {
         responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            concepts: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING },
+              description: 'An array of 5-7 strings of related concepts.',
+            },
+            artData: {
+              type: Type.OBJECT,
+              properties: {
+                art: {
+                  type: Type.STRING,
+                  description: `A string containing ASCII art representing "${topic}".`,
+                },
+                hotspots: {
+                  type: Type.ARRAY,
+                  description: "An array of interactive hotspot objects within the art.",
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      char: { type: Type.STRING },
+                      x: { type: Type.INTEGER },
+                      y: { type: Type.INTEGER },
+                      concept: { type: Type.STRING }
+                    },
+                    required: ['char', 'x', 'y', 'concept']
+                  }
+                }
+              },
+              required: ['art']
+            }
+          },
+          required: ['concepts', 'artData'],
+        },
       };
-      if (!ENABLE_THINKING_FOR_ASCII_ART) {
-        config.thinkingConfig = { thinkingBudget: 0 };
+
+      if (enableThinking) {
+          config.thinkingConfig = { thought: true };
+      } else {
+          config.thinkingConfig = { thinkingBudget: 0 };
       }
 
       const response = await ai.models.generateContent({
-        model: artModelName,
+        model: modelId,
         contents: prompt,
         config: config,
       });
-
+      
       let jsonStr = response.text.trim();
-      
-      // Debug logging
-      console.log(`Attempt ${attempt}/${maxRetries} - Raw API response:`, jsonStr);
-      
-      // Remove any markdown code fences if present
       const fenceRegex = /^```(?:json)?\s*\n?(.*?)\n?\s*```$/s;
       const match = jsonStr.match(fenceRegex);
       if (match && match[1]) {
         jsonStr = match[1].trim();
       }
 
-      // Ensure the string starts with { and ends with }
-      if (!jsonStr.startsWith('{') || !jsonStr.endsWith('}')) {
-        throw new Error('Response is not a valid JSON object');
-      }
-
-      const parsedData = JSON.parse(jsonStr) as AsciiArtData;
+      const parsed = JSON.parse(jsonStr) as AncillaryData;
       
-      // Validate the response structure
-      if (typeof parsedData.art !== 'string' || parsedData.art.trim().length === 0) {
+      if (typeof parsed.artData?.art !== 'string' || parsed.artData.art.trim().length === 0) {
         throw new Error('Invalid or empty ASCII art in response');
       }
       
-      // If we get here, the validation passed
-      const result: AsciiArtData = {
-        art: parsedData.art,
-      };
-
-      if (ENABLE_ASCII_TEXT_GENERATION && parsedData.text) {
-        result.text = parsedData.text;
-      }
-      
-      return result;
+      cache.set(cacheKey, parsed);
+      return parsed;
 
     } catch (error) {
-      lastError = error instanceof Error ? error : new Error('Unknown error occurred');
-      console.warn(`Attempt ${attempt}/${maxRetries} failed:`, lastError.message);
-      
-      if (attempt === maxRetries) {
-        console.error('All retry attempts failed for ASCII art generation');
-        throw new Error(`Could not generate ASCII art after ${maxRetries} attempts: ${lastError.message}`);
-      }
-      // Continue to next attempt
+      throw handleGeminiError(error, `generate ancillary data for "${topic}"`);
     }
+  };
+
+  return geminiRequestWithRetry(apiCall, onRetry);
+}
+
+
+/**
+ * Generates a detailed summary and curated resources for a given topic, with retry logic.
+ * @param topic The topic to generate a deep dive for.
+ * @param onRetry An optional callback to inform the UI about a retry attempt.
+ * @returns A promise resolving to an object with a summary and resources.
+ */
+export async function generateDeepDive(
+  topic: string,
+  onRetry?: (attempt: number, delay: number) => void
+): Promise<DeepDiveData> {
+  const modelId = settingsService.getActiveModelId();
+  const cacheKey = `deepdive_${modelId}_${topic.toLowerCase()}`;
+  const cachedData = cache.get<DeepDiveData>(cacheKey);
+  if (cachedData) {
+    return cachedData;
   }
 
-  // This should never be reached, but just in case
-  throw lastError || new Error('All retry attempts failed');
+  const apiCall = async () => {
+    const ai = getAiInstance();
+    const prompt = `
+      For the topic "${topic}", provide a detailed analysis. Your response must be in JSON format.
+
+      The JSON object should contain two keys:
+      1. "summary": A string containing a comprehensive, multi-paragraph summary exploring the nuances, history, and significance of the topic. Wrap key concepts and terms within the summary text in double square brackets, like "[[Vannevar Bush]]" or "[[hyperlink]]", to make them interactive.
+      2. "resources": An array of 3-5 objects, where each object represents a curated resource for further learning. Each resource object must have:
+        - "title": The title of the resource (e.g., an article, a book, a video).
+        - "url": The full URL to the resource. If it's a book, link to a relevant page like Goodreads or Wikipedia.
+        - "description": A brief, one-sentence description of what the resource offers.
+    `;
+
+    try {
+      const response = await ai.models.generateContent({
+        model: modelId,
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              summary: {
+                type: Type.STRING,
+                description: 'A detailed, multi-paragraph summary. Important, related keywords within the summary must be wrapped in double square brackets, e.g., [[keyword]].',
+              },
+              resources: {
+                type: Type.ARRAY,
+                description: 'An array of curated resources for further learning.',
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    title: { type: Type.STRING, description: 'The title of the resource.' },
+                    url: { type: Type.STRING, description: 'The URL for the resource.' },
+                    description: { type: Type.STRING, description: 'A brief description of the resource.' },
+                  },
+                  required: ['title', 'url', 'description'],
+                },
+              },
+            },
+            required: ['summary', 'resources'],
+          },
+        },
+      });
+
+      let jsonStr = response.text.trim();
+      const fenceRegex = /^```(?:json)?\s*\n?(.*?)\n?\s*```$/s;
+      const match = jsonStr.match(fenceRegex);
+      if (match && match[1]) {
+        jsonStr = match[1].trim();
+      }
+      
+      const parsed = JSON.parse(jsonStr) as DeepDiveData;
+      cache.set(cacheKey, parsed);
+      return parsed;
+    } catch (error) {
+      throw handleGeminiError(error, `generate deep dive for "${topic}"`);
+    }
+  };
+
+  return geminiRequestWithRetry(apiCall, onRetry);
 }

@@ -22,7 +22,7 @@ const QRCodeModal: React.FC<QRCodeModalProps> = ({ url, isOpen, onClose }) => {
         margin: 2,
         color: {
           dark: '#00ffff', // QR code dots (accent color)
-          light: '#0a0f1e'  // QR code background (background color)
+          light: '#00fc43'  // QR code background (background color)
         }
       }, (error) => {
         if (error) console.error('Error generating QR code:', error);
